@@ -14,7 +14,6 @@
           fileset = lib.fileset.unions [
             ../package.json
             ../README.md
-            ../SPEC.md
             ../extensions
           ];
         };
@@ -22,7 +21,7 @@
         installPhase = ''
           runHook preInstall
           mkdir -p "$out/${packagePath}"
-          cp -R package.json README.md SPEC.md extensions "$out/${packagePath}/"
+          cp -R package.json README.md extensions "$out/${packagePath}/"
           runHook postInstall
         '';
 

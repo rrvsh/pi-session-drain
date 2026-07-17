@@ -10,8 +10,7 @@ const DEFAULT_SESSION_DIR = "~/.pi/agent/sessions";
 const MAX_TRANSCRIPT_ENTRIES = 100;
 const MAX_TRANSCRIPT_CHARS = 40_000;
 const TOOL_RESULT_LIMIT = 2_000;
-const FINAL_STATUSES = new Set(["drained", "skipped", "deferred"]);
-const STATUSES = ["drained", "skipped", "deferred", "failed"] as const;
+const STATUSES = ["processed", "failed"] as const;
 type DrainStatus = (typeof STATUSES)[number];
 
 type Config = { sessionDirs?: string[] };
@@ -35,6 +34,16 @@ type SessionInfo = {
 	changed: boolean;
 	processed: boolean;
 };
+type DrainStatusSummary = {
+	session_dirs: string[];
+	missing_session_dirs: string[];
+	total: number;
+	processed: number;
+	failed: number;
+	unprocessed: number;
+	changed: number;
+	retryable: number;
+};
 type TranscriptEntry = {
 	line_number: number;
 	timestamp?: string | number;
@@ -50,7 +59,9 @@ export const internals = {
 	readState,
 	writeState,
 	findNextSessions,
+	getDrainStatus,
 	markSession,
+	markSessionByPath,
 	buildTranscriptPage,
 	transcriptEntriesForLine,
 };
@@ -59,7 +70,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "session_drain_next",
 		label: "Session Drain Next",
-		description: "Return undrained or retryable Pi sessions from configured session directories.",
+		description: "Return unprocessed or retryable Pi sessions from configured session directories.",
 		parameters: Type.Object({
 			limit: Type.Optional(Type.Number({ minimum: 1, maximum: 100, description: "Maximum sessions to return" })),
 		}),
@@ -70,6 +81,20 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: JSON.stringify({ session_id: sessions[0]?.session_id, session_ids: sessions.map((s) => s.session_id), sessions }, null, 2) }],
 				details: { session_id: sessions[0]?.session_id, session_ids: sessions.map((s) => s.session_id), sessions },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "session_drain_status",
+		label: "Session Drain Status",
+		description: "Return aggregate session-drain status for configured Pi session directories.",
+		parameters: Type.Object({}),
+		async execute() {
+			const status = await getDrainStatus();
+			return {
+				content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
+				details: status,
 			};
 		},
 	});
@@ -95,10 +120,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "session_drain_mark",
 		label: "Session Drain Mark",
-		description: "Mark the current hash of a session as drained, skipped, deferred, or failed.",
+		description: "Mark the current hash of a session as processed or failed.",
 		parameters: Type.Object({
 			session_id: Type.String({ description: "Session id to mark" }),
-			status: Type.Union(STATUSES.map((s) => Type.Literal(s)) as [ReturnType<typeof Type.Literal>, ReturnType<typeof Type.Literal>, ReturnType<typeof Type.Literal>, ReturnType<typeof Type.Literal>]),
+			status: Type.Union([Type.Literal("processed"), Type.Literal("failed")]),
 		}),
 		async execute(_toolCallId, params) {
 			const record = await markSession(params.session_id, params.status as DrainStatus);
@@ -110,20 +135,36 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("session-drain:status", {
-		description: "Drain undrained sessions in batches of four using subagents",
+		description: "Show aggregate session-drain status for configured Pi session directories",
+		handler: async (_args, ctx) => {
+			const status = await getDrainStatus();
+			ctx.ui.notify(formatStatus(status), "info");
+		},
+	});
+
+	pi.registerCommand("session-drain:drain", {
+		description: "Mark the current session processed, then drain unprocessed sessions in batches of four using subagents",
 		handler: async (_args, ctx) => {
 			if (!ctx.isIdle()) {
-				ctx.ui.notify("Agent is busy; try /session-drain:status when idle.", "warning");
+				ctx.ui.notify("Agent is busy; try /session-drain:drain when idle.", "warning");
 				return;
 			}
+			const sessionManager = (ctx as any).sessionManager;
+			const currentSessionId = sessionManager?.getSessionId?.();
+			const currentSessionFile = sessionManager?.getSessionFile?.();
+			if (!currentSessionId || !currentSessionFile) {
+				ctx.ui.notify("Cannot identify the current persisted session; not starting session drain.", "warning");
+				return;
+			}
+			await markSessionByPath(currentSessionId, currentSessionFile, "processed");
 			pi.sendUserMessage(`Drain Pi sessions using the session-drain tools.
 
 Process loop:
 1. Call session_drain_next with limit 4.
 2. If no sessions are returned, summarize current drain status and stop.
 3. For each returned session, assign exactly one subagent to drain that session. Pass only that session_id and tell the subagent to fetch transcript pages with session_drain_transcript until complete is true, update durable memory files from durable information in the transcript, then report changed files and outcome.
-4. Review each subagent outcome, then call session_drain_mark for that session with drained, skipped, deferred, or failed.
-5. Continue with another batch of four until no undrained sessions remain or you need user input.`);
+4. Review each subagent outcome, then call session_drain_mark for that session with processed or failed.
+5. Continue with another batch of four until no unprocessed or failed sessions remain or you need user input.`);
 		},
 	});
 }
@@ -152,6 +193,10 @@ async function readSessionDirs(): Promise<string[]> {
 	const envDirs = (process.env.PI_SESSION_DRAIN_DIRS ?? "").split(path.delimiter).map((s) => s.trim()).filter(Boolean);
 	const dirs = [DEFAULT_SESSION_DIR, ...(config.sessionDirs ?? []), ...envDirs].map((dir) => path.resolve(expandHome(dir)));
 	return Array.from(new Set(dirs));
+}
+
+function formatStatus(status: DrainStatusSummary): string {
+	return `Session drain: ${status.unprocessed} unprocessed, ${status.processed} processed, ${status.failed} failed/retryable, ${status.changed} changed, ${status.total} total`;
 }
 
 async function readState(): Promise<State> {
@@ -197,21 +242,68 @@ async function discoverSessions(): Promise<SessionInfo[]> {
 				status,
 				status_updated_at: current?.status_updated_at,
 				changed: Boolean(latest && latest.session_hash !== sessionHash),
-				processed: Boolean(status && FINAL_STATUSES.has(status)),
+				processed: status === "processed",
 			});
 		}
 	}
 	return sessions.sort((a, b) => a.session_path.localeCompare(b.session_path));
 }
 
+async function getDrainStatus(): Promise<DrainStatusSummary> {
+	const sessionDirs = await readSessionDirs();
+	const missingSessionDirs: string[] = [];
+	for (const sessionDir of sessionDirs) {
+		try {
+			const stat = await fs.stat(sessionDir);
+			if (!stat.isDirectory()) missingSessionDirs.push(sessionDir);
+		} catch (error: any) {
+			if (error?.code === "ENOENT") missingSessionDirs.push(sessionDir);
+			else throw error;
+		}
+	}
+	const sessions = await discoverSessions();
+	const processed = sessions.filter((session) => session.status === "processed").length;
+	const failed = sessions.filter((session) => session.status === "failed").length;
+	return {
+		session_dirs: sessionDirs,
+		missing_session_dirs: missingSessionDirs,
+		total: sessions.length,
+		processed,
+		failed,
+		unprocessed: sessions.length - processed - failed,
+		changed: sessions.filter((session) => session.changed).length,
+		retryable: failed,
+	};
+}
+
 async function findNextSessions(limit: number): Promise<SessionInfo[]> {
-	return (await discoverSessions()).filter((session) => !session.processed).slice(0, limit);
+	return (await discoverSessions()).filter((session) => session.status !== "processed").slice(0, limit);
 }
 
 async function markSession(sessionId: string, status: DrainStatus): Promise<StatusRecord> {
 	if (!STATUSES.includes(status)) throw new Error(`Invalid session drain status: ${status}`);
 	const session = (await discoverSessions()).find((candidate) => candidate.session_id === sessionId);
 	if (!session) throw new Error(`No configured session found for id ${sessionId}`);
+	return writeStatusRecord(session, status);
+}
+
+async function markSessionByPath(sessionId: string, sessionPath: string, status: DrainStatus): Promise<StatusRecord> {
+	if (!STATUSES.includes(status)) throw new Error(`Invalid session drain status: ${status}`);
+	const resolvedSessionPath = path.resolve(expandHome(sessionPath));
+	const sessionDirs = await readSessionDirs();
+	const sessionDir = sessionDirs.find((dir) => isPathInside(resolvedSessionPath, dir)) ?? path.dirname(resolvedSessionPath);
+	const session: SessionInfo = {
+		session_id: sessionId,
+		session_path: resolvedSessionPath,
+		session_dir: sessionDir,
+		session_hash: await fileHash(resolvedSessionPath),
+		changed: false,
+		processed: status === "processed",
+	};
+	return writeStatusRecord(session, status);
+}
+
+async function writeStatusRecord(session: Pick<SessionInfo, "session_id" | "session_path" | "session_dir" | "session_hash">, status: DrainStatus): Promise<StatusRecord> {
 	const record: StatusRecord = {
 		session_id: session.session_id,
 		session_path: session.session_path,
@@ -308,6 +400,11 @@ function textFromContent(content: unknown): string {
 function truncateDeterministic(value: string, limit: number): string {
 	if (value.length <= limit) return value;
 	return `${value.slice(0, Math.max(0, limit))}\n[truncated ${value.length - limit} chars]`;
+}
+
+function isPathInside(candidatePath: string, parentPath: string): boolean {
+	const relative = path.relative(parentPath, candidatePath);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 async function findJsonlFiles(root: string): Promise<string[]> {

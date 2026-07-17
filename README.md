@@ -5,11 +5,13 @@ A Pi package that exposes session-drain state for historical Pi JSONL sessions.
 ## What it provides
 
 - Tools:
-  - `session_drain_next` — find undrained/retryable sessions.
+  - `session_drain_status` — summarize configured session directories by status.
+  - `session_drain_next` — find unprocessed/retryable sessions.
   - `session_drain_transcript` — page a deterministic transcript by raw JSONL line number.
-  - `session_drain_mark` — mark the current session hash as `drained`, `skipped`, `deferred`, or `failed`.
-- Command:
-  - `/session-drain:status` — queue a prompt that asks the agent to drain sessions in batches of four using subagents.
+  - `session_drain_mark` — mark the current session hash as `processed` or `failed`.
+- Commands:
+  - `/session-drain:status` — show aggregate status for configured session directories.
+  - `/session-drain:drain` — mark the current session as `processed`, then queue the batch/subagent drain workflow.
 
 State is stored in `~/Agents/.session-drain/status.json`.
 
@@ -37,7 +39,9 @@ pi install git:github.com:rrvsh/pi-session-drain
 For local testing:
 
 ```bash
-pi -e /home/rafiq/Git/pi-session-drain
+git clone https://github.com/rrvsh/pi-session-drain.git
+cd pi-session-drain
+pi -e .
 ```
 
 ## Nix
