@@ -20,6 +20,8 @@ A Pi package that exposes session-drain state for historical Pi JSONL sessions.
 
 Chunk subagents report durable memory candidates only. The parent agent reviews chunk reports, performs any memory edits serially, and marks sessions.
 
+Nested subagent child sessions are excluded by default from status, next-batch planning, chunk planning, and transcript reads. Pass `include_child_sessions: true` only for explicit inspection/debugging.
+
 State is stored in `~/Agents/.session-drain/status.json`.
 
 ## Session directories

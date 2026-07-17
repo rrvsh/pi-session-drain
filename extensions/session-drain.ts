@@ -77,16 +77,24 @@ type SessionInfo = {
 	status_updated_at?: string;
 	changed: boolean;
 	processed: boolean;
+	is_subagent_child: boolean;
+	parent_session_id?: string;
+	parent_session_path?: string;
+	parent_status?: DrainStatus;
+	run_id?: string;
+	child_index?: number;
 };
 type DrainStatusSummary = {
 	session_dirs: string[];
 	missing_session_dirs: string[];
+	include_child_sessions: boolean;
 	total: number;
 	processed: number;
 	failed: number;
 	unprocessed: number;
 	changed: number;
 	retryable: number;
+	excluded_child_sessions: number;
 };
 type TranscriptEntry = {
 	line_number: number;
@@ -135,11 +143,12 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			limit: Type.Optional(Type.Number({ minimum: 1, maximum: 1000, description: "Maximum transcript chunks to return; complete sessions only" })),
 			session_id: Type.Optional(Type.String({ description: "Plan only this session, used when retrying an oversized session" })),
+			include_child_sessions: Type.Optional(Type.Boolean({ description: "Include nested subagent child sessions; defaults to false" })),
 		}),
 		async execute(_toolCallId, params) {
 			const requestedLimit = typeof params.limit === "number" ? params.limit : 1;
 			const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(1000, Math.trunc(requestedLimit))) : 1;
-			const next = await findNextSessions(limit, typeof params.session_id === "string" ? params.session_id : undefined);
+			const next = await findNextSessions(limit, typeof params.session_id === "string" ? params.session_id : undefined, params.include_child_sessions === true);
 			return {
 				content: [{ type: "text", text: JSON.stringify(next, null, 2) }],
 				details: next,
@@ -151,9 +160,11 @@ export default function (pi: ExtensionAPI) {
 		name: "session_drain_status",
 		label: "Session Drain Status",
 		description: "Return aggregate session-drain status for configured Pi session directories.",
-		parameters: Type.Object({}),
-		async execute() {
-			const status = await getDrainStatus();
+		parameters: Type.Object({
+			include_child_sessions: Type.Optional(Type.Boolean({ description: "Include nested subagent child sessions in status counts; defaults to false" })),
+		}),
+		async execute(_toolCallId, params) {
+			const status = await getDrainStatus(params.include_child_sessions === true);
 			return {
 				content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
 				details: status,
@@ -167,9 +178,10 @@ export default function (pi: ExtensionAPI) {
 		description: "Return deterministic transcript chunk metadata for a Pi session without transcript content.",
 		parameters: Type.Object({
 			session_id: Type.String({ description: "Session id from session_drain_next" }),
+			include_child_sessions: Type.Optional(Type.Boolean({ description: "Allow chunk planning for nested subagent child sessions; defaults to false" })),
 		}),
 		async execute(_toolCallId, params) {
-			const chunks = await buildTranscriptChunks(params.session_id);
+			const chunks = await buildTranscriptChunks(params.session_id, params.include_child_sessions === true);
 			return {
 				content: [{ type: "text", text: JSON.stringify(chunks, null, 2) }],
 				details: chunks,
@@ -185,6 +197,7 @@ export default function (pi: ExtensionAPI) {
 			session_id: Type.String({ description: "Session id from session_drain_next" }),
 			after_line: Type.Optional(Type.Number({ minimum: 0, description: "Return transcript entries after this raw JSONL line" })),
 			until_line: Type.Optional(Type.Number({ minimum: 1, description: "Stop after this raw JSONL line" })),
+			include_child_sessions: Type.Optional(Type.Boolean({ description: "Allow transcript reads for nested subagent child sessions; defaults to false" })),
 		}),
 		async execute(_toolCallId, params) {
 			const requestedAfterLine = typeof params.after_line === "number" ? params.after_line : 0;
@@ -193,6 +206,7 @@ export default function (pi: ExtensionAPI) {
 				params.session_id,
 				Number.isFinite(requestedAfterLine) ? Math.max(0, Math.trunc(requestedAfterLine)) : 0,
 				requestedUntilLine !== undefined && Number.isFinite(requestedUntilLine) ? Math.max(1, Math.trunc(requestedUntilLine)) : undefined,
+				params.include_child_sessions === true,
 			);
 			return {
 				content: [{ type: "text", text: JSON.stringify(page, null, 2) }],
@@ -337,7 +351,7 @@ async function readSessionDirs(): Promise<string[]> {
 }
 
 function formatStatus(status: DrainStatusSummary): string {
-	return `Session drain: ${status.unprocessed} unprocessed, ${status.processed} processed, ${status.failed} failed/retryable, ${status.changed} changed, ${status.total} total`;
+	return `Session drain: ${status.unprocessed} unprocessed, ${status.processed} processed, ${status.failed} failed/retryable, ${status.changed} changed, ${status.total} total, ${status.excluded_child_sessions} child sessions excluded`;
 }
 
 async function readState(): Promise<State> {
@@ -407,6 +421,7 @@ async function discoverSessions(): Promise<SessionInfo[]> {
 		for (const sessionPath of await findJsonlFiles(sessionDir)) {
 			const header = await readSessionHeader(sessionPath);
 			if (!header?.id) continue;
+			const childInfo = subagentChildInfo(sessionPath);
 			const sessionHash = await fileHash(sessionPath);
 			const records = state.records.filter((record) => record.session_id === header.id);
 			const latest = records.at(-1);
@@ -422,13 +437,25 @@ async function discoverSessions(): Promise<SessionInfo[]> {
 				status_updated_at: current?.status_updated_at,
 				changed: Boolean(latest && latest.session_hash !== sessionHash),
 				processed: status === "processed",
+				is_subagent_child: Boolean(childInfo),
+				...childInfo,
 			});
+		}
+	}
+	const byPath = new Map(sessions.map((session) => [session.session_path, session]));
+	for (const session of sessions) {
+		if (session.parent_session_path) {
+			const parent = byPath.get(session.parent_session_path);
+			if (parent) {
+				session.parent_session_id = parent.session_id;
+				session.parent_status = parent.status;
+			}
 		}
 	}
 	return sessions.sort((a, b) => a.session_path.localeCompare(b.session_path));
 }
 
-async function getDrainStatus(): Promise<DrainStatusSummary> {
+async function getDrainStatus(includeChildSessions = false): Promise<DrainStatusSummary> {
 	const sessionDirs = await readSessionDirs();
 	const missingSessionDirs: string[] = [];
 	for (const sessionDir of sessionDirs) {
@@ -440,30 +467,34 @@ async function getDrainStatus(): Promise<DrainStatusSummary> {
 			else throw error;
 		}
 	}
-	const sessions = await discoverSessions();
+	const discoveredSessions = await discoverSessions();
+	const excludedChildSessions = includeChildSessions ? 0 : discoveredSessions.filter((session) => session.is_subagent_child).length;
+	const sessions = discoveredSessions.filter((session) => includeChildSessions || !session.is_subagent_child);
 	const processed = sessions.filter((session) => session.status === "processed").length;
 	const failed = sessions.filter((session) => session.status === "failed").length;
 	return {
 		session_dirs: sessionDirs,
 		missing_session_dirs: missingSessionDirs,
+		include_child_sessions: includeChildSessions,
 		total: sessions.length,
 		processed,
 		failed,
 		unprocessed: sessions.length - processed - failed,
 		changed: sessions.filter((session) => session.changed).length,
 		retryable: failed,
+		excluded_child_sessions: excludedChildSessions,
 	};
 }
 
-async function findNextSessions(limit: number, sessionId?: string) {
-	const eligibleSessions = (await discoverSessions()).filter((session) => session.status !== "processed" && (!sessionId || session.session_id === sessionId));
+async function findNextSessions(limit: number, sessionId?: string, includeChildSessions = false) {
+	const eligibleSessions = (await discoverSessions()).filter((session) => session.status !== "processed" && (includeChildSessions || !session.is_subagent_child) && (!sessionId || session.session_id === sessionId));
 	const sessions: Array<SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }> = [];
 	let chunkCount = 0;
 	let oversizedSessionId: string | undefined;
 	let oversizedChunkCount: number | undefined;
 
 	for (const session of eligibleSessions) {
-		const plan = await buildTranscriptChunks(session.session_id);
+		const plan = await buildTranscriptChunks(session.session_id, includeChildSessions);
 		const sessionChunkCount = plan.chunk_count;
 		if (!sessionId && sessions.length === 0 && sessionChunkCount > limit) {
 			oversizedSessionId = session.session_id;
@@ -480,6 +511,7 @@ async function findNextSessions(limit: number, sessionId?: string) {
 	const result: Record<string, unknown> = {
 		limit,
 		chunk_limit: limit,
+		include_child_sessions: includeChildSessions,
 		chunk_count: chunkCount,
 		session_count: sessions.length,
 		session_id: sessions[0]?.session_id,
@@ -519,6 +551,7 @@ async function markSessionByPath(sessionId: string, sessionPath: string, status:
 	const resolvedSessionPath = path.resolve(expandHome(sessionPath));
 	const sessionDirs = await readSessionDirs();
 	const sessionDir = sessionDirs.find((dir) => isPathInside(resolvedSessionPath, dir)) ?? path.dirname(resolvedSessionPath);
+	const childInfo = subagentChildInfo(resolvedSessionPath);
 	const session: SessionInfo = {
 		session_id: sessionId,
 		session_path: resolvedSessionPath,
@@ -526,6 +559,8 @@ async function markSessionByPath(sessionId: string, sessionPath: string, status:
 		session_hash: await fileHash(resolvedSessionPath),
 		changed: false,
 		processed: status === "processed",
+		is_subagent_child: Boolean(childInfo),
+		...childInfo,
 	};
 	return writeStatusRecord(session, status);
 }
@@ -556,9 +591,9 @@ async function writeStatusRecords(items: Array<{ session: Pick<SessionInfo, "ses
 	});
 }
 
-async function buildTranscriptChunks(sessionId: string) {
-	const session = (await discoverSessions()).find((candidate) => candidate.session_id === sessionId);
-	if (!session) throw new Error(`No configured session found for id ${sessionId}`);
+async function buildTranscriptChunks(sessionId: string, includeChildSessions = false) {
+	const session = (await discoverSessions()).find((candidate) => candidate.session_id === sessionId && (includeChildSessions || !candidate.is_subagent_child));
+	if (!session) throw new Error(`No configured non-child session found for id ${sessionId}`);
 	const entries = await loadTranscriptEntries(session.session_path);
 	const chunks: TranscriptChunk[] = [];
 	let currentEntries = 0;
@@ -584,9 +619,9 @@ async function buildTranscriptChunks(sessionId: string) {
 	return { session_id: sessionId, session_path: session.session_path, session_dir: session.session_dir, session_hash: session.session_hash, chunk_count: chunks.length, chunks };
 }
 
-async function buildTranscriptPage(sessionId: string, afterLine = 0, untilLine?: number) {
-	const session = (await discoverSessions()).find((candidate) => candidate.session_id === sessionId);
-	if (!session) throw new Error(`No configured session found for id ${sessionId}`);
+async function buildTranscriptPage(sessionId: string, afterLine = 0, untilLine?: number, includeChildSessions = false) {
+	const session = (await discoverSessions()).find((candidate) => candidate.session_id === sessionId && (includeChildSessions || !candidate.is_subagent_child));
+	if (!session) throw new Error(`No configured non-child session found for id ${sessionId}`);
 	const transcriptEntries = await loadTranscriptEntries(session.session_path);
 	const rangeEntries = transcriptEntries.filter((entry) => entry.line_number > afterLine && (untilLine === undefined || entry.line_number <= untilLine));
 	const entries: TranscriptEntry[] = [];
@@ -687,6 +722,18 @@ function truncateDeterministic(value: string, limit: number): string {
 function isPathInside(candidatePath: string, parentPath: string): boolean {
 	const relative = path.relative(parentPath, candidatePath);
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function subagentChildInfo(sessionPath: string): Pick<SessionInfo, "parent_session_id" | "parent_session_path" | "run_id" | "child_index"> | undefined {
+	const normalized = path.resolve(sessionPath);
+	const match = normalized.match(/^(.*\/([^/]+)_([0-9a-fA-F-]{36}))\/([0-9a-fA-F]{8})\/run-(\d+)\/session\.jsonl$/);
+	if (!match) return undefined;
+	return {
+		parent_session_id: match[3],
+		parent_session_path: `${match[1]}.jsonl`,
+		run_id: match[4],
+		child_index: Number.parseInt(match[5]!, 10),
+	};
 }
 
 async function findJsonlFiles(root: string): Promise<string[]> {
