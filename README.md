@@ -11,7 +11,8 @@ A Pi package that exposes session-drain state for historical Pi JSONL sessions.
   - `session_drain_mark` — mark the current session hash as `processed` or `failed`.
 - Commands:
   - `/session-drain:status` — show aggregate status for configured session directories.
-  - `/session-drain:drain` — mark the current session as `processed`, then queue the batch/subagent drain workflow.
+  - `/session-drain:drain` — queue the batch/subagent drain workflow.
+  - `/session-drain:drain-current` — mark the current active session as `processed`.
 
 State is stored in `~/Agents/.session-drain/status.json`.
 

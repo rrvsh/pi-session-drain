@@ -143,20 +143,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("session-drain:drain", {
-		description: "Mark the current session processed, then drain unprocessed sessions in batches of four using subagents",
+		description: "Drain unprocessed sessions in batches of four using subagents",
 		handler: async (_args, ctx) => {
 			if (!ctx.isIdle()) {
 				ctx.ui.notify("Agent is busy; try /session-drain:drain when idle.", "warning");
 				return;
 			}
-			const sessionManager = (ctx as any).sessionManager;
-			const currentSessionId = sessionManager?.getSessionId?.();
-			const currentSessionFile = sessionManager?.getSessionFile?.();
-			if (!currentSessionId || !currentSessionFile) {
-				ctx.ui.notify("Cannot identify the current persisted session; not starting session drain.", "warning");
-				return;
-			}
-			await markSessionByPath(currentSessionId, currentSessionFile, "processed");
 			pi.sendUserMessage(`Drain Pi sessions using the session-drain tools.
 
 Process loop:
@@ -165,6 +157,21 @@ Process loop:
 3. For each returned session, assign exactly one subagent to drain that session. Pass only that session_id and tell the subagent to fetch transcript pages with session_drain_transcript until complete is true, update durable memory files from durable information in the transcript, then report changed files and outcome.
 4. Review each subagent outcome, then call session_drain_mark for that session with processed or failed.
 5. Continue with another batch of four until no unprocessed or failed sessions remain or you need user input.`);
+		},
+	});
+
+	pi.registerCommand("session-drain:drain-current", {
+		description: "Mark the current active persisted session as processed",
+		handler: async (_args, ctx) => {
+			const sessionManager = (ctx as any).sessionManager;
+			const currentSessionId = sessionManager?.getSessionId?.();
+			const currentSessionFile = sessionManager?.getSessionFile?.();
+			if (!currentSessionId || !currentSessionFile) {
+				ctx.ui.notify("Cannot identify the current persisted session.", "warning");
+				return;
+			}
+			await markSessionByPath(currentSessionId, currentSessionFile, "processed");
+			ctx.ui.notify(`Marked current session ${currentSessionId} as processed.`, "info");
 		},
 	});
 }
