@@ -131,17 +131,18 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "session_drain_next",
 		label: "Session Drain Next",
-		description: "Return unprocessed or retryable Pi sessions from configured session directories.",
+		description: "Return the next unprocessed or retryable Pi session chunks, using limit as a chunk budget and preserving session boundaries.",
 		parameters: Type.Object({
-			limit: Type.Optional(Type.Number({ minimum: 1, maximum: 100, description: "Maximum sessions to return" })),
+			limit: Type.Optional(Type.Number({ minimum: 1, maximum: 1000, description: "Maximum transcript chunks to return; complete sessions only" })),
+			session_id: Type.Optional(Type.String({ description: "Plan only this session, used when retrying an oversized session" })),
 		}),
 		async execute(_toolCallId, params) {
 			const requestedLimit = typeof params.limit === "number" ? params.limit : 1;
-			const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(100, Math.trunc(requestedLimit))) : 1;
-			const sessions = await findNextSessions(limit);
+			const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(1000, Math.trunc(requestedLimit))) : 1;
+			const next = await findNextSessions(limit, typeof params.session_id === "string" ? params.session_id : undefined);
 			return {
-				content: [{ type: "text", text: JSON.stringify({ session_id: sessions[0]?.session_id, session_ids: sessions.map((s) => s.session_id), sessions }, null, 2) }],
-				details: { session_id: sessions[0]?.session_id, session_ids: sessions.map((s) => s.session_id), sessions },
+				content: [{ type: "text", text: JSON.stringify(next, null, 2) }],
+				details: next,
 			};
 		},
 	});
@@ -255,14 +256,15 @@ export default function (pi: ExtensionAPI) {
 
 Process loop:
 1. Call session_drain_next with limit 4.
-2. If no sessions are returned, summarize current drain status and stop.
-3. For each returned session, call session_drain_chunks.
-4. Assign one session-drain-chunk subagent per chunk, with bounded concurrency. Pass session_id, session_path, session_dir, chunk_index, after_line, until_line, entry_count, and approx_chars.
-5. Require each chunk subagent to report chunk telemetry, memory candidates with source references, skipped candidates, and chunk-processed or chunk-failed.
-6. Parent synthesis checklist: verify every chunk returned chunk-processed; verify chunks cover the full session in order; verify the final chunk reports session_complete true; dedupe candidates; discard transient diagnostics and task-only paths; normalize obsolete paths; check existing memory before adding duplicates; apply memory edits serially in parent.
-7. Mark the session processed only when all chunks succeeded, edits are complete, and uncertainty is resolved. Mark failed otherwise.
-8. Prefer session_drain_mark_many when marking reviewed batches.
-9. Continue with another batch of four sessions until no unprocessed or failed sessions remain or you need user input.`);
+2. If no sessions are returned and no oversized_session_id is returned, summarize current drain status and stop.
+3. If oversized_session_id is returned, call session_drain_next again with that session_id and limit equal to required_limit.
+4. Use the chunks embedded in the returned sessions. Do not call session_drain_chunks in the normal drain path.
+5. Assign one session-drain-chunk subagent per chunk, with bounded concurrency. Pass session_id, session_path, session_dir, chunk_index, after_line, until_line, entry_count, and approx_chars.
+6. Require each chunk subagent to report chunk telemetry, memory candidates with source references, skipped candidates, and chunk-processed or chunk-failed.
+7. Parent synthesis checklist: verify every chunk returned chunk-processed; verify chunks cover the full session in order; verify the final chunk reports session_complete true; dedupe candidates; discard transient diagnostics and task-only paths; normalize obsolete paths; check existing memory before adding duplicates; apply memory edits serially in parent.
+8. Mark the session processed only when all chunks succeeded, edits are complete, and uncertainty is resolved. Mark failed otherwise.
+9. Prefer session_drain_mark_many when marking reviewed batches.
+10. Continue with another batch until no unprocessed or failed sessions remain or you need user input.`);
 		},
 	});
 
@@ -453,8 +455,44 @@ async function getDrainStatus(): Promise<DrainStatusSummary> {
 	};
 }
 
-async function findNextSessions(limit: number): Promise<SessionInfo[]> {
-	return (await discoverSessions()).filter((session) => session.status !== "processed").slice(0, limit);
+async function findNextSessions(limit: number, sessionId?: string) {
+	const eligibleSessions = (await discoverSessions()).filter((session) => session.status !== "processed" && (!sessionId || session.session_id === sessionId));
+	const sessions: Array<SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }> = [];
+	let chunkCount = 0;
+	let oversizedSessionId: string | undefined;
+	let oversizedChunkCount: number | undefined;
+
+	for (const session of eligibleSessions) {
+		const plan = await buildTranscriptChunks(session.session_id);
+		const sessionChunkCount = plan.chunk_count;
+		if (!sessionId && sessions.length === 0 && sessionChunkCount > limit) {
+			oversizedSessionId = session.session_id;
+			oversizedChunkCount = sessionChunkCount;
+			break;
+		}
+		if (!sessionId && sessions.length > 0 && chunkCount + sessionChunkCount > limit) break;
+		if (!sessionId && sessions.length === 0 && chunkCount + sessionChunkCount > limit) break;
+		sessions.push({ ...session, chunk_count: sessionChunkCount, chunks: plan.chunks });
+		chunkCount += sessionChunkCount;
+		if (sessionId) break;
+	}
+
+	const result: Record<string, unknown> = {
+		limit,
+		chunk_limit: limit,
+		chunk_count: chunkCount,
+		session_count: sessions.length,
+		session_id: sessions[0]?.session_id,
+		session_ids: sessions.map((session) => session.session_id),
+		sessions,
+	};
+	if (oversizedSessionId && oversizedChunkCount !== undefined) {
+		result.oversized_session_id = oversizedSessionId;
+		result.oversized_chunk_count = oversizedChunkCount;
+		result.required_limit = oversizedChunkCount;
+		result.message = `Next session ${oversizedSessionId} requires ${oversizedChunkCount} chunks; call session_drain_next with session_id ${oversizedSessionId} and limit ${oversizedChunkCount}.`;
+	}
+	return result;
 }
 
 async function markSession(sessionId: string, status: DrainStatus): Promise<StatusRecord> {
