@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -10,6 +10,31 @@ const DEFAULT_SESSION_DIR = "~/.pi/agent/sessions";
 const MAX_TRANSCRIPT_ENTRIES = 100;
 const MAX_TRANSCRIPT_CHARS = 40_000;
 const TOOL_RESULT_LIMIT = 2_000;
+const LOCK_TIMEOUT_MS = 10_000;
+const LOCK_STALE_MS = 60_000;
+const MANAGED_AGENT_MARKER = "<!-- managed-by: pi-session-drain -->";
+const SESSION_DRAIN_AGENT = `---
+name: session-drain
+description: Drain one Pi session transcript into durable memory updates.
+tools: read, grep, find, ls, edit, write, session_drain_transcript
+inheritProjectContext: false
+inheritSkills: false
+defaultContext: fresh
+---
+${MANAGED_AGENT_MARKER}
+
+Drain exactly one session_id provided by the parent.
+
+Fetch transcript pages with session_drain_transcript until complete is true.
+
+Extract only durable information from the transcript.
+
+Update durable memory files under ~/Agents/memory only when appropriate.
+
+Do not mark the session. The parent owns session_drain_mark after reviewing your outcome.
+
+Report changed files, memory updates made, skipped/ambiguous items, and outcome.
+`;
 const STATUSES = ["processed", "failed"] as const;
 type DrainStatus = (typeof STATUSES)[number];
 
@@ -67,6 +92,13 @@ export const internals = {
 };
 
 export default function (pi: ExtensionAPI) {
+	pi.on("session_start", async (_event, ctx) => {
+		const result = await ensureManagedSubagent();
+		if (result === "conflict") {
+			ctx.ui.notify("session-drain subagent file already exists and is not managed by pi-session-drain; leaving it unchanged.", "warning");
+		}
+	});
+
 	pi.registerTool({
 		name: "session_drain_next",
 		label: "Session Drain Next",
@@ -154,7 +186,7 @@ export default function (pi: ExtensionAPI) {
 Process loop:
 1. Call session_drain_next with limit 4.
 2. If no sessions are returned, summarize current drain status and stop.
-3. For each returned session, assign exactly one subagent to drain that session. Pass only that session_id and tell the subagent to fetch transcript pages with session_drain_transcript until complete is true, update durable memory files from durable information in the transcript, then report changed files and outcome.
+3. For each returned session, assign exactly one session-drain subagent to drain that session. Pass only that session_id and tell the subagent to fetch transcript pages with session_drain_transcript until complete is true, update durable memory files from durable information in the transcript, then report changed files and outcome.
 4. Review each subagent outcome, then call session_drain_mark for that session with processed or failed.
 5. Continue with another batch of four until no unprocessed or failed sessions remain or you need user input.`);
 		},
@@ -191,8 +223,27 @@ async function readJsonFile<T>(file: string, fallback: T): Promise<T> {
 		return JSON.parse(await fs.readFile(file, "utf8")) as T;
 	} catch (error: any) {
 		if (error?.code === "ENOENT") return fallback;
+		if (error instanceof SyntaxError) {
+			throw new Error(`Failed to parse ${file}. The session-drain status/config JSON may be corrupted; back it up and repair or move it aside. Original parse error: ${error.message}`);
+		}
 		throw error;
 	}
+}
+
+async function ensureManagedSubagent(): Promise<"created" | "updated" | "unchanged" | "conflict"> {
+	const agentsDir = path.join(os.homedir(), ".pi", "agent", "agents");
+	const agentPath = path.join(agentsDir, "session-drain.md");
+	let existing: string | undefined;
+	try {
+		existing = await fs.readFile(agentPath, "utf8");
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") throw error;
+	}
+	if (existing !== undefined && !existing.includes(MANAGED_AGENT_MARKER)) return "conflict";
+	if (existing === SESSION_DRAIN_AGENT) return "unchanged";
+	await fs.mkdir(agentsDir, { recursive: true });
+	await fs.writeFile(agentPath, SESSION_DRAIN_AGENT, "utf8");
+	return existing === undefined ? "created" : "updated";
 }
 
 async function readSessionDirs(): Promise<string[]> {
@@ -214,9 +265,47 @@ async function readState(): Promise<State> {
 async function writeState(state: State): Promise<void> {
 	await fs.mkdir(stateDir(), { recursive: true });
 	const file = path.join(stateDir(), "status.json");
-	const tmp = `${file}.${process.pid}.tmp`;
+	const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
 	await fs.writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 	await fs.rename(tmp, file);
+}
+
+async function withStateLock<T>(operation: () => Promise<T>): Promise<T> {
+	await fs.mkdir(stateDir(), { recursive: true });
+	const lockDir = path.join(stateDir(), "status.lock");
+	const startedAt = Date.now();
+	while (true) {
+		try {
+			await fs.mkdir(lockDir);
+			await fs.writeFile(path.join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }) + "\n", "utf8");
+			break;
+		} catch (error: any) {
+			if (error?.code !== "EEXIST") throw error;
+			if (Date.now() - startedAt > LOCK_TIMEOUT_MS) {
+				throw new Error(`Timed out waiting for session-drain state lock at ${lockDir}`);
+			}
+			try {
+				const stat = await fs.stat(lockDir);
+				if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+					await fs.rm(lockDir, { recursive: true, force: true });
+					continue;
+				}
+			} catch (statError: any) {
+				if (statError?.code === "ENOENT") continue;
+				throw statError;
+			}
+			await sleep(50);
+		}
+	}
+	try {
+		return await operation();
+	} finally {
+		await fs.rm(lockDir, { recursive: true, force: true });
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function discoverSessions(): Promise<SessionInfo[]> {
@@ -311,18 +400,20 @@ async function markSessionByPath(sessionId: string, sessionPath: string, status:
 }
 
 async function writeStatusRecord(session: Pick<SessionInfo, "session_id" | "session_path" | "session_dir" | "session_hash">, status: DrainStatus): Promise<StatusRecord> {
-	const record: StatusRecord = {
-		session_id: session.session_id,
-		session_path: session.session_path,
-		session_dir: session.session_dir,
-		session_hash: session.session_hash,
-		status,
-		status_updated_at: new Date().toISOString(),
-	};
-	const state = await readState();
-	state.records.push(record);
-	await writeState(state);
-	return record;
+	return withStateLock(async () => {
+		const record: StatusRecord = {
+			session_id: session.session_id,
+			session_path: session.session_path,
+			session_dir: session.session_dir,
+			session_hash: session.session_hash,
+			status,
+			status_updated_at: new Date().toISOString(),
+		};
+		const state = await readState();
+		state.records.push(record);
+		await writeState(state);
+		return record;
+	});
 }
 
 async function buildTranscriptPage(sessionId: string, afterLine = 0) {

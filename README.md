@@ -13,6 +13,8 @@ A Pi package that exposes session-drain state for historical Pi JSONL sessions.
   - `/session-drain:status` — show aggregate status for configured session directories.
   - `/session-drain:drain` — queue the batch/subagent drain workflow.
   - `/session-drain:drain-current` — mark the current active session as `processed`.
+- Managed subagent:
+  - `session-drain` — installed at `~/.pi/agent/agents/session-drain.md` and allowed to call `session_drain_transcript`.
 
 State is stored in `~/Agents/.session-drain/status.json`.
 
