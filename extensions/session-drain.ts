@@ -16,7 +16,7 @@ const MANAGED_AGENT_MARKER = "<!-- managed-by: pi-session-drain -->";
 const SESSION_DRAIN_CHUNK_AGENT = `---
 name: session-drain-chunk
 description: Analyze one bounded Pi session transcript chunk and report durable memory candidates.
-tools: session_drain_transcript
+tools: read, grep, find, ls, session_drain_transcript
 inheritProjectContext: false
 inheritSkills: false
 defaultContext: fresh
@@ -25,16 +25,22 @@ ${MANAGED_AGENT_MARKER}
 
 Analyze exactly one transcript chunk provided by the parent.
 
-Required input: session_id, chunk_index, after_line, until_line.
+Required input: session_id, session_path, session_dir, chunk_index, after_line, until_line, entry_count, approx_chars.
 
-Call session_drain_transcript with exactly that session_id, after_line, and until_line.
+Call session_drain_transcript with exactly that session_id, after_line, and until_line. Treat it as the authoritative chunk source.
 
-Do not fetch beyond the assigned chunk.
+Do not fetch transcript content outside the assigned chunk unless the parent explicitly instructs you to do so.
+
+Use read, grep, find, and ls only for supporting local research when needed. Do not read unrelated large files wholesale.
 
 Do not edit files or update memory. Report candidates only.
 
+Include transcript line references and relevant file paths for every candidate.
+
 Final report shape:
 Session: <session_id>
+Session path: <session_path>
+Session dir: <session_dir>
 Chunk: <chunk_index>
 After line: <after_line>
 Until line: <until_line>
@@ -43,7 +49,7 @@ Next after line: <next_after_line>
 Range complete: <true|false>
 Session complete: <true|false>
 Memory candidates:
-- <candidate or none>
+- <candidate/source refs or none>
 Skipped candidates:
 - <candidate/reason or none>
 Outcome: <chunk-processed|chunk-failed>
@@ -106,6 +112,7 @@ export const internals = {
 	findNextSessions,
 	getDrainStatus,
 	markSession,
+	markSessions,
 	markSessionByPath,
 	buildTranscriptChunks,
 	buildTranscriptPage,
@@ -194,6 +201,25 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "session_drain_mark_many",
+		label: "Session Drain Mark Many",
+		description: "Mark current hashes of multiple sessions as processed or failed in one transaction.",
+		parameters: Type.Object({
+			marks: Type.Array(Type.Object({
+				session_id: Type.String({ description: "Session id to mark" }),
+				status: Type.Union([Type.Literal("processed"), Type.Literal("failed")]),
+			}), { minItems: 1, maxItems: 100 }),
+		}),
+		async execute(_toolCallId, params) {
+			const result = await markSessions(params.marks as Array<{ session_id: string; status: DrainStatus }>);
+			return {
+				content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+				details: result,
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "session_drain_mark",
 		label: "Session Drain Mark",
 		description: "Mark the current hash of a session as processed or failed.",
@@ -231,11 +257,12 @@ Process loop:
 1. Call session_drain_next with limit 4.
 2. If no sessions are returned, summarize current drain status and stop.
 3. For each returned session, call session_drain_chunks.
-4. Assign one session-drain-chunk subagent per chunk, with bounded concurrency. Pass session_id, chunk_index, after_line, and until_line.
-5. Require each chunk subagent to report chunk telemetry, memory candidates, skipped candidates, and chunk-processed or chunk-failed.
-6. Synthesize memory updates in the parent after reviewing chunk reports. Chunk subagents must not edit memory.
-7. Mark the session processed only when all chunks succeeded and parent synthesis is complete. Mark failed if any chunk failed or synthesis is uncertain.
-8. Continue with another batch of four sessions until no unprocessed or failed sessions remain or you need user input.`);
+4. Assign one session-drain-chunk subagent per chunk, with bounded concurrency. Pass session_id, session_path, session_dir, chunk_index, after_line, until_line, entry_count, and approx_chars.
+5. Require each chunk subagent to report chunk telemetry, memory candidates with source references, skipped candidates, and chunk-processed or chunk-failed.
+6. Parent synthesis checklist: verify every chunk returned chunk-processed; verify chunks cover the full session in order; verify the final chunk reports session_complete true; dedupe candidates; discard transient diagnostics and task-only paths; normalize obsolete paths; check existing memory before adding duplicates; apply memory edits serially in parent.
+7. Mark the session processed only when all chunks succeeded, edits are complete, and uncertainty is resolved. Mark failed otherwise.
+8. Prefer session_drain_mark_many when marking reviewed batches.
+9. Continue with another batch of four sessions until no unprocessed or failed sessions remain or you need user input.`);
 		},
 	});
 
@@ -431,10 +458,22 @@ async function findNextSessions(limit: number): Promise<SessionInfo[]> {
 }
 
 async function markSession(sessionId: string, status: DrainStatus): Promise<StatusRecord> {
-	if (!STATUSES.includes(status)) throw new Error(`Invalid session drain status: ${status}`);
-	const session = (await discoverSessions()).find((candidate) => candidate.session_id === sessionId);
-	if (!session) throw new Error(`No configured session found for id ${sessionId}`);
-	return writeStatusRecord(session, status);
+	const result = await markSessions([{ session_id: sessionId, status }]);
+	return result.records[0]!;
+}
+
+async function markSessions(marks: Array<{ session_id: string; status: DrainStatus }>): Promise<{ records: StatusRecord[]; processed: number; failed: number }> {
+	if (marks.length === 0) throw new Error("At least one session mark is required");
+	for (const mark of marks) {
+		if (!STATUSES.includes(mark.status)) throw new Error(`Invalid session drain status: ${mark.status}`);
+	}
+	const sessions = await discoverSessions();
+	const recordsToWrite = marks.map((mark) => {
+		const session = sessions.find((candidate) => candidate.session_id === mark.session_id);
+		if (!session) throw new Error(`No configured session found for id ${mark.session_id}`);
+		return { session, status: mark.status };
+	});
+	return writeStatusRecords(recordsToWrite);
 }
 
 async function markSessionByPath(sessionId: string, sessionPath: string, status: DrainStatus): Promise<StatusRecord> {
@@ -454,19 +493,28 @@ async function markSessionByPath(sessionId: string, sessionPath: string, status:
 }
 
 async function writeStatusRecord(session: Pick<SessionInfo, "session_id" | "session_path" | "session_dir" | "session_hash">, status: DrainStatus): Promise<StatusRecord> {
+	return (await writeStatusRecords([{ session, status }])).records[0]!;
+}
+
+async function writeStatusRecords(items: Array<{ session: Pick<SessionInfo, "session_id" | "session_path" | "session_dir" | "session_hash">; status: DrainStatus }>): Promise<{ records: StatusRecord[]; processed: number; failed: number }> {
 	return withStateLock(async () => {
-		const record: StatusRecord = {
+		const now = new Date().toISOString();
+		const records = items.map(({ session, status }) => ({
 			session_id: session.session_id,
 			session_path: session.session_path,
 			session_dir: session.session_dir,
 			session_hash: session.session_hash,
 			status,
-			status_updated_at: new Date().toISOString(),
-		};
+			status_updated_at: now,
+		}));
 		const state = await readState();
-		state.records.push(record);
+		state.records.push(...records);
 		await writeState(state);
-		return record;
+		return {
+			records,
+			processed: records.filter((record) => record.status === "processed").length,
+			failed: records.filter((record) => record.status === "failed").length,
+		};
 	});
 }
 
@@ -495,7 +543,7 @@ async function buildTranscriptChunks(sessionId: string) {
 	if (currentEntries > 0) {
 		chunks.push({ chunk_index: chunks.length, after_line: afterLine, until_line: untilLine, entry_count: currentEntries, approx_chars: currentChars });
 	}
-	return { session_id: sessionId, session_hash: session.session_hash, chunk_count: chunks.length, chunks };
+	return { session_id: sessionId, session_path: session.session_path, session_dir: session.session_dir, session_hash: session.session_hash, chunk_count: chunks.length, chunks };
 }
 
 async function buildTranscriptPage(sessionId: string, afterLine = 0, untilLine?: number) {
