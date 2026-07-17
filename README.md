@@ -31,7 +31,7 @@ Additional/configured directories can be supplied either with:
 ## Install in Pi
 
 ```bash
-pi install git:github.com:rafiqism/pi-session-drain
+pi install git:github.com:rrvsh/pi-session-drain
 ```
 
 For local testing:

@@ -49,7 +49,7 @@
 
         meta = {
           description = "Pi extension for discovering, paging, and marking session-drain state";
-          homepage = "https://github.com/rafiqism/pi-session-drain";
+          homepage = "https://github.com/rrvsh/pi-session-drain";
           license = lib.licenses.mit;
           platforms = [
             "aarch64-darwin"
