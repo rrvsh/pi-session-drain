@@ -13,27 +13,40 @@ const TOOL_RESULT_LIMIT = 2_000;
 const LOCK_TIMEOUT_MS = 10_000;
 const LOCK_STALE_MS = 60_000;
 const MANAGED_AGENT_MARKER = "<!-- managed-by: pi-session-drain -->";
-const SESSION_DRAIN_AGENT = `---
-name: session-drain
-description: Drain one Pi session transcript into durable memory updates.
-tools: read, grep, find, ls, edit, write, session_drain_transcript
+const SESSION_DRAIN_CHUNK_AGENT = `---
+name: session-drain-chunk
+description: Analyze one bounded Pi session transcript chunk and report durable memory candidates.
+tools: session_drain_transcript
 inheritProjectContext: false
 inheritSkills: false
 defaultContext: fresh
 ---
 ${MANAGED_AGENT_MARKER}
 
-Drain exactly one session_id provided by the parent.
+Analyze exactly one transcript chunk provided by the parent.
 
-Fetch transcript pages with session_drain_transcript until complete is true.
+Required input: session_id, chunk_index, after_line, until_line.
 
-Extract only durable information from the transcript.
+Call session_drain_transcript with exactly that session_id, after_line, and until_line.
 
-Update durable memory files under ~/Agents/memory only when appropriate.
+Do not fetch beyond the assigned chunk.
 
-Do not mark the session. The parent owns session_drain_mark after reviewing your outcome.
+Do not edit files or update memory. Report candidates only.
 
-Report changed files, memory updates made, skipped/ambiguous items, and outcome.
+Final report shape:
+Session: <session_id>
+Chunk: <chunk_index>
+After line: <after_line>
+Until line: <until_line>
+Entries returned: <number>
+Next after line: <next_after_line>
+Range complete: <true|false>
+Session complete: <true|false>
+Memory candidates:
+- <candidate or none>
+Skipped candidates:
+- <candidate/reason or none>
+Outcome: <chunk-processed|chunk-failed>
 `;
 const STATUSES = ["processed", "failed"] as const;
 type DrainStatus = (typeof STATUSES)[number];
@@ -75,6 +88,13 @@ type TranscriptEntry = {
 	role: string;
 	content: unknown;
 };
+type TranscriptChunk = {
+	chunk_index: number;
+	after_line: number;
+	until_line: number;
+	entry_count: number;
+	approx_chars: number;
+};
 
 export const internals = {
 	expandHome,
@@ -87,7 +107,9 @@ export const internals = {
 	getDrainStatus,
 	markSession,
 	markSessionByPath,
+	buildTranscriptChunks,
 	buildTranscriptPage,
+	loadTranscriptEntries,
 	transcriptEntriesForLine,
 };
 
@@ -95,7 +117,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const result = await ensureManagedSubagent();
 		if (result === "conflict") {
-			ctx.ui.notify("session-drain subagent file already exists and is not managed by pi-session-drain; leaving it unchanged.", "warning");
+			ctx.ui.notify("session-drain-chunk subagent file already exists and is not managed by pi-session-drain; leaving it unchanged.", "warning");
 		}
 	});
 
@@ -132,16 +154,38 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "session_drain_chunks",
+		label: "Session Drain Chunks",
+		description: "Return deterministic transcript chunk metadata for a Pi session without transcript content.",
+		parameters: Type.Object({
+			session_id: Type.String({ description: "Session id from session_drain_next" }),
+		}),
+		async execute(_toolCallId, params) {
+			const chunks = await buildTranscriptChunks(params.session_id);
+			return {
+				content: [{ type: "text", text: JSON.stringify(chunks, null, 2) }],
+				details: chunks,
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "session_drain_transcript",
 		label: "Session Drain Transcript",
 		description: "Return a deterministic transcript page for a Pi session by raw JSONL line number.",
 		parameters: Type.Object({
 			session_id: Type.String({ description: "Session id from session_drain_next" }),
 			after_line: Type.Optional(Type.Number({ minimum: 0, description: "Return transcript entries after this raw JSONL line" })),
+			until_line: Type.Optional(Type.Number({ minimum: 1, description: "Stop after this raw JSONL line" })),
 		}),
 		async execute(_toolCallId, params) {
 			const requestedAfterLine = typeof params.after_line === "number" ? params.after_line : 0;
-			const page = await buildTranscriptPage(params.session_id, Number.isFinite(requestedAfterLine) ? Math.max(0, Math.trunc(requestedAfterLine)) : 0);
+			const requestedUntilLine = typeof params.until_line === "number" ? params.until_line : undefined;
+			const page = await buildTranscriptPage(
+				params.session_id,
+				Number.isFinite(requestedAfterLine) ? Math.max(0, Math.trunc(requestedAfterLine)) : 0,
+				requestedUntilLine !== undefined && Number.isFinite(requestedUntilLine) ? Math.max(1, Math.trunc(requestedUntilLine)) : undefined,
+			);
 			return {
 				content: [{ type: "text", text: JSON.stringify(page, null, 2) }],
 				details: page,
@@ -186,9 +230,12 @@ export default function (pi: ExtensionAPI) {
 Process loop:
 1. Call session_drain_next with limit 4.
 2. If no sessions are returned, summarize current drain status and stop.
-3. For each returned session, assign exactly one session-drain subagent to drain that session. Pass only that session_id and tell the subagent to fetch transcript pages with session_drain_transcript until complete is true, update durable memory files from durable information in the transcript, then report changed files and outcome.
-4. Review each subagent outcome, then call session_drain_mark for that session with processed or failed.
-5. Continue with another batch of four until no unprocessed or failed sessions remain or you need user input.`);
+3. For each returned session, call session_drain_chunks.
+4. Assign one session-drain-chunk subagent per chunk, with bounded concurrency. Pass session_id, chunk_index, after_line, and until_line.
+5. Require each chunk subagent to report chunk telemetry, memory candidates, skipped candidates, and chunk-processed or chunk-failed.
+6. Synthesize memory updates in the parent after reviewing chunk reports. Chunk subagents must not edit memory.
+7. Mark the session processed only when all chunks succeeded and parent synthesis is complete. Mark failed if any chunk failed or synthesis is uncertain.
+8. Continue with another batch of four sessions until no unprocessed or failed sessions remain or you need user input.`);
 		},
 	});
 
@@ -232,7 +279,14 @@ async function readJsonFile<T>(file: string, fallback: T): Promise<T> {
 
 async function ensureManagedSubagent(): Promise<"created" | "updated" | "unchanged" | "conflict"> {
 	const agentsDir = path.join(os.homedir(), ".pi", "agent", "agents");
-	const agentPath = path.join(agentsDir, "session-drain.md");
+	const oldAgentPath = path.join(agentsDir, "session-drain.md");
+	try {
+		const oldAgent = await fs.readFile(oldAgentPath, "utf8");
+		if (oldAgent.includes(MANAGED_AGENT_MARKER)) await fs.rm(oldAgentPath, { force: true });
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") throw error;
+	}
+	const agentPath = path.join(agentsDir, "session-drain-chunk.md");
 	let existing: string | undefined;
 	try {
 		existing = await fs.readFile(agentPath, "utf8");
@@ -240,9 +294,9 @@ async function ensureManagedSubagent(): Promise<"created" | "updated" | "unchang
 		if (error?.code !== "ENOENT") throw error;
 	}
 	if (existing !== undefined && !existing.includes(MANAGED_AGENT_MARKER)) return "conflict";
-	if (existing === SESSION_DRAIN_AGENT) return "unchanged";
+	if (existing === SESSION_DRAIN_CHUNK_AGENT) return "unchanged";
 	await fs.mkdir(agentsDir, { recursive: true });
-	await fs.writeFile(agentPath, SESSION_DRAIN_AGENT, "utf8");
+	await fs.writeFile(agentPath, SESSION_DRAIN_CHUNK_AGENT, "utf8");
 	return existing === undefined ? "created" : "updated";
 }
 
@@ -416,35 +470,79 @@ async function writeStatusRecord(session: Pick<SessionInfo, "session_id" | "sess
 	});
 }
 
-async function buildTranscriptPage(sessionId: string, afterLine = 0) {
+async function buildTranscriptChunks(sessionId: string) {
 	const session = (await discoverSessions()).find((candidate) => candidate.session_id === sessionId);
 	if (!session) throw new Error(`No configured session found for id ${sessionId}`);
-	const lines = (await fs.readFile(session.session_path, "utf8")).split(/\r?\n/);
+	const entries = await loadTranscriptEntries(session.session_path);
+	const chunks: TranscriptChunk[] = [];
+	let currentEntries = 0;
+	let currentChars = 0;
+	let afterLine = 0;
+	let untilLine = 0;
+
+	for (const entry of entries) {
+		const entryChars = JSON.stringify(entry).length;
+		if (currentEntries > 0 && (currentEntries >= MAX_TRANSCRIPT_ENTRIES || currentChars + entryChars > MAX_TRANSCRIPT_CHARS)) {
+			chunks.push({ chunk_index: chunks.length, after_line: afterLine, until_line: untilLine, entry_count: currentEntries, approx_chars: currentChars });
+			afterLine = untilLine;
+			currentEntries = 0;
+			currentChars = 0;
+		}
+		currentEntries += 1;
+		currentChars += entryChars;
+		untilLine = entry.line_number;
+	}
+	if (currentEntries > 0) {
+		chunks.push({ chunk_index: chunks.length, after_line: afterLine, until_line: untilLine, entry_count: currentEntries, approx_chars: currentChars });
+	}
+	return { session_id: sessionId, session_hash: session.session_hash, chunk_count: chunks.length, chunks };
+}
+
+async function buildTranscriptPage(sessionId: string, afterLine = 0, untilLine?: number) {
+	const session = (await discoverSessions()).find((candidate) => candidate.session_id === sessionId);
+	if (!session) throw new Error(`No configured session found for id ${sessionId}`);
+	const transcriptEntries = await loadTranscriptEntries(session.session_path);
+	const rangeEntries = transcriptEntries.filter((entry) => entry.line_number > afterLine && (untilLine === undefined || entry.line_number <= untilLine));
 	const entries: TranscriptEntry[] = [];
 	let charCount = 0;
 	let nextAfterLine = afterLine;
-	let complete = true;
+	let hitLimit = false;
 
-	for (let index = Math.max(0, afterLine); index < lines.length; index++) {
-		const line = lines[index];
-		const lineNumber = index + 1;
-		if (!line.trim()) continue;
-		const lineEntries = transcriptEntriesForLine(line, lineNumber);
-		for (const entry of lineEntries) {
-			const entryChars = JSON.stringify(entry).length;
-			if (entries.length >= MAX_TRANSCRIPT_ENTRIES || (entries.length > 0 && charCount + entryChars > MAX_TRANSCRIPT_CHARS)) {
-				complete = false;
-				return { session_id: sessionId, entries, next_after_line: nextAfterLine, complete };
-			}
-			if (entryChars > MAX_TRANSCRIPT_CHARS && entries.length === 0) {
-				entry.content = truncateDeterministic(JSON.stringify(entry.content), MAX_TRANSCRIPT_CHARS - 500);
-			}
-			entries.push(entry);
-			charCount += JSON.stringify(entry).length;
-			nextAfterLine = lineNumber;
+	for (const entry of rangeEntries) {
+		const entryChars = JSON.stringify(entry).length;
+		if (entries.length >= MAX_TRANSCRIPT_ENTRIES || (entries.length > 0 && charCount + entryChars > MAX_TRANSCRIPT_CHARS)) {
+			hitLimit = true;
+			break;
 		}
+		if (entryChars > MAX_TRANSCRIPT_CHARS && entries.length === 0) {
+			entry.content = truncateDeterministic(JSON.stringify(entry.content), MAX_TRANSCRIPT_CHARS - 500);
+		}
+		entries.push(entry);
+		charCount += JSON.stringify(entry).length;
+		nextAfterLine = entry.line_number;
 	}
-	return { session_id: sessionId, entries, next_after_line: nextAfterLine, complete };
+
+	const rangeComplete = !hitLimit && !rangeEntries.some((entry) => entry.line_number > nextAfterLine);
+	const sessionComplete = !transcriptEntries.some((entry) => entry.line_number > nextAfterLine);
+	return {
+		session_id: sessionId,
+		entries,
+		next_after_line: nextAfterLine,
+		complete: untilLine === undefined ? sessionComplete : rangeComplete,
+		range_complete: rangeComplete,
+		session_complete: sessionComplete,
+	};
+}
+
+async function loadTranscriptEntries(sessionPath: string): Promise<TranscriptEntry[]> {
+	const lines = (await fs.readFile(sessionPath, "utf8")).split(/\r?\n/);
+	const entries: TranscriptEntry[] = [];
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index];
+		if (!line.trim()) continue;
+		entries.push(...transcriptEntriesForLine(line, index + 1));
+	}
+	return entries;
 }
 
 function transcriptEntriesForLine(line: string, lineNumber: number): TranscriptEntry[] {
