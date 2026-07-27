@@ -9,20 +9,21 @@ A Pi package that exposes session-drain state for historical Pi JSONL sessions.
   - `session_drain_next` — find unprocessed/retryable work using `limit` as a chunk budget, returning complete sessions with embedded chunks.
   - `session_drain_chunks` — plan bounded transcript chunks for one session without returning transcript content.
   - `session_drain_transcript` — page a deterministic transcript by raw JSONL line number, optionally bounded by `until_line`.
-  - `session_drain_mark` — mark the current session hash as `processed` or `failed`.
+  - `session_drain_mark` — mark the current session hash as `processed`, `failed`, or `deferred`.
   - `session_drain_mark_many` — mark multiple current session hashes in one transaction.
 - Commands:
   - `/session-drain:status` — show aggregate status for configured session directories.
-  - `/session-drain:drain` — queue the batch/subagent drain workflow.
+  - `/session-drain:drain` — run the deterministic unattended drain workflow.
+  - `/session-drain:run` — alias for the deterministic unattended drain workflow.
   - `/session-drain:drain-current` — mark the current active session as `processed`.
 - Managed subagent:
   - `session-drain-chunk` — installed at `~/.pi/agent/agents/session-drain-chunk.md`, allowed to call `read`, `grep`, `find`, `ls`, and `session_drain_transcript`, and limited to one assigned transcript chunk.
 
-Chunk subagents report durable memory candidates only. The parent agent reviews chunk reports, performs any memory edits serially, and marks sessions.
+The deterministic runner owns session selection, oversized-session handling, chunk fanout, chunk validation, run artifacts, and status marking. Chunk LLM workers report durable memory candidates only. A synthesis LLM step reviews chunk reports, performs any memory edits serially, and must report `Outcome: processed` before the runner marks a session processed.
 
 Nested subagent child sessions are excluded by default from status, next-batch planning, chunk planning, and transcript reads. Pass `include_child_sessions: true` only for explicit inspection/debugging.
 
-State is stored in `~/Agents/.session-drain/status.json`.
+State is stored in `~/Agents/.session-drain/status.json`. Per-run observability artifacts are stored under `~/Agents/.session-drain/runs/<run-id>/` (`manifest.json`, `events.jsonl`, chunk reports, synthesis report, and `summary.json`).
 
 ## Session directories
 

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -12,6 +13,11 @@ const MAX_TRANSCRIPT_CHARS = 40_000;
 const TOOL_RESULT_LIMIT = 2_000;
 const LOCK_TIMEOUT_MS = 10_000;
 const LOCK_STALE_MS = 60_000;
+const RUN_LOCK_STALE_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_RUN_MAX_SESSIONS = 1;
+const DEFAULT_RUN_MAX_CHUNKS_PER_SESSION = 80;
+const DEFAULT_RUN_CHUNK_CONCURRENCY = 4;
+const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MANAGED_AGENT_MARKER = "<!-- managed-by: pi-session-drain -->";
 const SESSION_DRAIN_CHUNK_AGENT = `---
 name: session-drain-chunk
@@ -54,7 +60,7 @@ Skipped candidates:
 - <candidate/reason or none>
 Outcome: <chunk-processed|chunk-failed>
 `;
-const STATUSES = ["processed", "failed"] as const;
+const STATUSES = ["processed", "failed", "deferred"] as const;
 type DrainStatus = (typeof STATUSES)[number];
 
 type Config = { sessionDirs?: string[] };
@@ -67,6 +73,29 @@ type StatusRecord = {
 	status_updated_at: string;
 };
 type State = { records: StatusRecord[] };
+type RunOptions = {
+	max_sessions: number;
+	max_chunks_per_session: number;
+	chunk_concurrency: number;
+	timeout_ms: number;
+};
+type RunManifest = {
+	run_id: string;
+	started_at: string;
+	finished_at?: string;
+	status: "running" | "processed" | "failed";
+	options: RunOptions;
+	sessions: Array<{
+		session_id: string;
+		session_path: string;
+		session_hash: string;
+		status: "planned" | "chunks_processed" | "processed" | "failed" | "deferred";
+		chunk_count: number;
+		chunks: Array<TranscriptChunk & { report_path?: string; status?: "processed" | "failed" }>;
+		synthesis_path?: string;
+		error?: string;
+	}>;
+};
 type SessionInfo = {
 	session_id: string;
 	session_path: string;
@@ -91,6 +120,7 @@ type DrainStatusSummary = {
 	total: number;
 	processed: number;
 	failed: number;
+	deferred: number;
 	unprocessed: number;
 	changed: number;
 	retryable: number;
@@ -218,11 +248,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "session_drain_mark_many",
 		label: "Session Drain Mark Many",
-		description: "Mark current hashes of multiple sessions as processed or failed in one transaction.",
+		description: "Mark current hashes of multiple sessions as processed, failed, or deferred in one transaction.",
 		parameters: Type.Object({
 			marks: Type.Array(Type.Object({
 				session_id: Type.String({ description: "Session id to mark" }),
-				status: Type.Union([Type.Literal("processed"), Type.Literal("failed")]),
+				status: Type.Union([Type.Literal("processed"), Type.Literal("failed"), Type.Literal("deferred")]),
 			}), { minItems: 1, maxItems: 100 }),
 		}),
 		async execute(_toolCallId, params) {
@@ -237,10 +267,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "session_drain_mark",
 		label: "Session Drain Mark",
-		description: "Mark the current hash of a session as processed or failed.",
+		description: "Mark the current hash of a session as processed, failed, or deferred.",
 		parameters: Type.Object({
 			session_id: Type.String({ description: "Session id to mark" }),
-			status: Type.Union([Type.Literal("processed"), Type.Literal("failed")]),
+			status: Type.Union([Type.Literal("processed"), Type.Literal("failed"), Type.Literal("deferred")]),
 		}),
 		async execute(_toolCallId, params) {
 			const record = await markSession(params.session_id, params.status as DrainStatus);
@@ -260,25 +290,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("session-drain:drain", {
-		description: "Drain unprocessed sessions in batches of four using subagents",
+		description: "Drain unprocessed sessions with the deterministic session-drain runner",
 		handler: async (_args, ctx) => {
 			if (!ctx.isIdle()) {
 				ctx.ui.notify("Agent is busy; try /session-drain:drain when idle.", "warning");
 				return;
 			}
-			pi.sendUserMessage(`Drain Pi sessions using the session-drain tools.
+			const result = await runDeterministicDrain();
+			ctx.ui.notify(`Session drain run ${result.run_id}: ${result.status}. Artifact: ${result.run_dir}`, result.status === "processed" ? "info" : "warning");
+		},
+	});
 
-Process loop:
-1. Call session_drain_next with limit 4.
-2. If no sessions are returned and no oversized_session_id is returned, summarize current drain status and stop.
-3. If oversized_session_id is returned, call session_drain_next again with that session_id and limit equal to required_limit.
-4. Use the chunks embedded in the returned sessions. Do not call session_drain_chunks in the normal drain path.
-5. Assign one session-drain-chunk subagent per chunk, with bounded concurrency. Pass session_id, session_path, session_dir, chunk_index, after_line, until_line, entry_count, and approx_chars.
-6. Require each chunk subagent to report chunk telemetry, memory candidates with source references, skipped candidates, and chunk-processed or chunk-failed.
-7. Parent synthesis checklist: verify every chunk returned chunk-processed; verify chunks cover the full session in order; verify the final chunk reports session_complete true; dedupe candidates; discard transient diagnostics and task-only paths; normalize obsolete paths; check existing memory before adding duplicates; apply memory edits serially in parent.
-8. Mark the session processed only when all chunks succeeded, edits are complete, and uncertainty is resolved. Mark failed otherwise.
-9. Prefer session_drain_mark_many when marking reviewed batches.
-10. Continue with another batch until no unprocessed or failed sessions remain or you need user input.`);
+	pi.registerCommand("session-drain:run", {
+		description: "Run the deterministic unattended session drain workflow",
+		handler: async (_args, ctx) => {
+			const result = await runDeterministicDrain();
+			ctx.ui.notify(`Session drain run ${result.run_id}: ${result.status}. Artifact: ${result.run_dir}`, result.status === "processed" ? "info" : "warning");
 		},
 	});
 
@@ -351,7 +378,7 @@ async function readSessionDirs(): Promise<string[]> {
 }
 
 function formatStatus(status: DrainStatusSummary): string {
-	return `Session drain: ${status.unprocessed} unprocessed, ${status.processed} processed, ${status.failed} failed/retryable, ${status.changed} changed, ${status.total} total, ${status.excluded_child_sessions} child sessions excluded`;
+	return `Session drain: ${status.unprocessed} unprocessed, ${status.processed} processed, ${status.failed} failed/retryable, ${status.deferred} deferred, ${status.changed} changed, ${status.total} total, ${status.excluded_child_sessions} child sessions excluded`;
 }
 
 async function readState(): Promise<State> {
@@ -403,6 +430,215 @@ async function withStateLock<T>(operation: () => Promise<T>): Promise<T> {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runDeterministicDrain(): Promise<{ run_id: string; run_dir: string; status: "processed" | "failed" }> {
+	return withRunLock(async () => {
+		const options: RunOptions = {
+			max_sessions: Number(process.env.PI_SESSION_DRAIN_MAX_SESSIONS ?? DEFAULT_RUN_MAX_SESSIONS),
+			max_chunks_per_session: Number(process.env.PI_SESSION_DRAIN_MAX_CHUNKS_PER_SESSION ?? DEFAULT_RUN_MAX_CHUNKS_PER_SESSION),
+			chunk_concurrency: Number(process.env.PI_SESSION_DRAIN_CHUNK_CONCURRENCY ?? DEFAULT_RUN_CHUNK_CONCURRENCY),
+			timeout_ms: Number(process.env.PI_SESSION_DRAIN_TIMEOUT_MS ?? DEFAULT_RUN_TIMEOUT_MS),
+		};
+		const started = Date.now();
+		const runId = new Date().toISOString().replace(/[:.]/g, "-");
+		const runDir = path.join(stateDir(), "runs", runId);
+		await fs.mkdir(path.join(runDir, "chunks"), { recursive: true });
+		await fs.mkdir(path.join(runDir, "synthesis"), { recursive: true });
+		const manifest: RunManifest = { run_id: runId, started_at: new Date(started).toISOString(), status: "running", options, sessions: [] };
+		await writeRunManifest(runDir, manifest);
+		try {
+			for (let processedSessions = 0; processedSessions < options.max_sessions && Date.now() - started < options.timeout_ms;) {
+				const next = await nextSessionForRun(options.max_chunks_per_session);
+				if (!next) break;
+				const sessionState: RunManifest["sessions"][number] = {
+					session_id: next.session_id,
+					session_path: next.session_path,
+					session_hash: next.session_hash,
+					status: "planned",
+					chunk_count: next.chunk_count,
+					chunks: next.chunks.map((chunk) => ({ ...chunk })),
+				};
+				manifest.sessions.push(sessionState);
+				await appendRunEvent(runDir, { timestamp: new Date().toISOString(), type: "session_planned", session_id: next.session_id, chunk_count: next.chunk_count });
+				await writeRunManifest(runDir, manifest);
+				if (next.chunk_count > options.max_chunks_per_session) {
+					sessionState.status = "deferred";
+					sessionState.error = `Session requires ${next.chunk_count} chunks, above max_chunks_per_session ${options.max_chunks_per_session}`;
+					await markSession(next.session_id, "deferred");
+					processedSessions += 1;
+					await writeRunManifest(runDir, manifest);
+					continue;
+				}
+				const chunkReports = await runChunkReports(runDir, next, options.chunk_concurrency);
+				for (const report of chunkReports) {
+					const chunk = sessionState.chunks.find((candidate) => candidate.chunk_index === report.chunk.chunk_index);
+					if (chunk) {
+						chunk.report_path = report.path;
+						chunk.status = report.ok ? "processed" : "failed";
+					}
+				}
+				const validationError = validateChunkReports(next.chunks, chunkReports);
+				if (validationError) {
+					sessionState.status = "failed";
+					sessionState.error = validationError;
+					await markSession(next.session_id, "failed");
+					processedSessions += 1;
+					await writeRunManifest(runDir, manifest);
+					continue;
+				}
+				sessionState.status = "chunks_processed";
+				await writeRunManifest(runDir, manifest);
+				const synthesis = await runSynthesis(runDir, next, chunkReports.map((report) => report.path));
+				sessionState.synthesis_path = synthesis.path;
+				if (synthesis.ok) {
+					sessionState.status = "processed";
+					await markSession(next.session_id, "processed");
+				} else {
+					sessionState.status = "failed";
+					sessionState.error = "Synthesis did not report Outcome: processed";
+					await markSession(next.session_id, "failed");
+				}
+				processedSessions += 1;
+				await writeRunManifest(runDir, manifest);
+			}
+			manifest.status = manifest.sessions.some((session) => session.status === "failed") ? "failed" : "processed";
+			return { run_id: runId, run_dir: runDir, status: manifest.status };
+		} catch (error: any) {
+			manifest.status = "failed";
+			await appendRunEvent(runDir, { timestamp: new Date().toISOString(), type: "run_error", error: error?.message ?? String(error) });
+			return { run_id: runId, run_dir: runDir, status: "failed" };
+		} finally {
+			manifest.finished_at = new Date().toISOString();
+			await writeRunManifest(runDir, manifest);
+			await fs.writeFile(path.join(runDir, "summary.json"), `${JSON.stringify({ run_id: manifest.run_id, status: manifest.status, started_at: manifest.started_at, finished_at: manifest.finished_at, sessions: manifest.sessions.map((session) => ({ session_id: session.session_id, status: session.status, chunk_count: session.chunk_count, error: session.error })) }, null, 2)}\n`, "utf8");
+		}
+	});
+}
+
+async function withRunLock<T>(operation: () => Promise<T>): Promise<T> {
+	await fs.mkdir(stateDir(), { recursive: true });
+	const lockDir = path.join(stateDir(), "run.lock");
+	try {
+		await fs.mkdir(lockDir);
+		await fs.writeFile(path.join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }) + "\n", "utf8");
+	} catch (error: any) {
+		if (error?.code !== "EEXIST") throw error;
+		const stat = await fs.stat(lockDir);
+		if (Date.now() - stat.mtimeMs <= RUN_LOCK_STALE_MS) throw new Error(`Session drain run already active at ${lockDir}`);
+		await fs.rm(lockDir, { recursive: true, force: true });
+		return withRunLock(operation);
+	}
+	try {
+		return await operation();
+	} finally {
+		await fs.rm(lockDir, { recursive: true, force: true });
+	}
+}
+
+async function nextSessionForRun(maxChunksPerSession: number): Promise<(SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }) | undefined> {
+	const eligible = (await discoverSessions()).filter((session) => session.status !== "processed" && session.status !== "deferred" && !session.is_subagent_child);
+	for (const session of eligible) {
+		const plan = await buildTranscriptChunks(session.session_id);
+		if (plan.chunk_count > maxChunksPerSession) return { ...session, chunk_count: plan.chunk_count, chunks: plan.chunks };
+		return { ...session, chunk_count: plan.chunk_count, chunks: plan.chunks };
+	}
+	return undefined;
+}
+
+async function runChunkReports(runDir: string, session: SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }, concurrency: number): Promise<Array<{ chunk: TranscriptChunk; path: string; ok: boolean }>> {
+	const results: Array<{ chunk: TranscriptChunk; path: string; ok: boolean }> = [];
+	let nextIndex = 0;
+	async function worker(): Promise<void> {
+		while (nextIndex < session.chunks.length) {
+			const chunk = session.chunks[nextIndex++]!;
+			const reportPath = path.join(runDir, "chunks", `${session.session_id}-${String(chunk.chunk_index).padStart(3, "0")}.md`);
+			const prompt = chunkPrompt(session, chunk);
+			const result = await runPiPrompt(prompt, os.homedir());
+			await fs.writeFile(reportPath, result.output, "utf8");
+			results.push({ chunk, path: reportPath, ok: result.exitCode === 0 && /Outcome:\s*chunk-processed/i.test(result.output) });
+		}
+	}
+	await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, session.chunks.length)) }, () => worker()));
+	return results.sort((a, b) => a.chunk.chunk_index - b.chunk.chunk_index);
+}
+
+function validateChunkReports(chunks: TranscriptChunk[], reports: Array<{ chunk: TranscriptChunk; ok: boolean }>): string | undefined {
+	if (reports.length !== chunks.length) return `Expected ${chunks.length} chunk reports, got ${reports.length}`;
+	for (const chunk of chunks) {
+		const report = reports.find((candidate) => candidate.chunk.chunk_index === chunk.chunk_index);
+		if (!report) return `Missing chunk report ${chunk.chunk_index}`;
+		if (!report.ok) return `Chunk ${chunk.chunk_index} failed`;
+	}
+	return undefined;
+}
+
+async function runSynthesis(runDir: string, session: SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }, reportPaths: string[]): Promise<{ path: string; ok: boolean }> {
+	const synthesisPath = path.join(runDir, "synthesis", `${session.session_id}.md`);
+	const prompt = `Synthesize durable agent memory updates for Pi session ${session.session_id}.
+
+Chunk report files:
+${reportPaths.map((file) => `- ${file}`).join("\n")}
+
+Read the chunk reports and existing /home/rafiq/Agents/MEMORY.md plus relevant /home/rafiq/Agents/memory/**/*.md files. Add or update only durable memory: stable preferences, corrections, environment/tool quirks, project state, and completed session summaries worth keeping. Discard transient task progress, raw transcripts, logs, secrets, credentials, and duplicates.
+
+Edit memory files directly if there are durable updates. Keep entries compact. If there are no durable updates, make no edits.
+
+Final lines must include:
+Memory files changed: <list or none>
+Outcome: processed`;
+	const result = await runPiPrompt(prompt, path.join(os.homedir(), "Agents"));
+	await fs.writeFile(synthesisPath, result.output, "utf8");
+	return { path: synthesisPath, ok: result.exitCode === 0 && /Outcome:\s*processed/i.test(result.output) };
+}
+
+function chunkPrompt(session: SessionInfo, chunk: TranscriptChunk): string {
+	return `Analyze exactly this Pi session transcript chunk for durable memory candidates.
+
+session_id: ${session.session_id}
+session_path: ${session.session_path}
+session_dir: ${session.session_dir}
+chunk_index: ${chunk.chunk_index}
+after_line: ${chunk.after_line}
+until_line: ${chunk.until_line}
+entry_count: ${chunk.entry_count}
+approx_chars: ${chunk.approx_chars}
+
+Call session_drain_transcript with exactly this session_id, after_line, and until_line. Do not inspect other transcript ranges. Do not edit files. Report durable memory candidates only, with source line references. Discard transient progress, raw logs, secrets, and duplicates.
+
+Final report must include exactly these fields:
+Session: ${session.session_id}
+Chunk: ${chunk.chunk_index}
+After line: ${chunk.after_line}
+Until line: ${chunk.until_line}
+Entries returned: <number>
+Next after line: <number>
+Range complete: <true|false>
+Session complete: <true|false>
+Memory candidates:
+- <candidate/source refs or none>
+Skipped candidates:
+- <candidate/reason or none>
+Outcome: chunk-processed`;
+}
+
+async function runPiPrompt(prompt: string, cwd: string): Promise<{ exitCode: number; output: string }> {
+	return new Promise((resolve) => {
+		const child = spawn("pi", ["--no-session", "-p", prompt], { cwd, env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+		let output = "";
+		child.stdout.on("data", (chunk) => { output += chunk.toString(); });
+		child.stderr.on("data", (chunk) => { output += chunk.toString(); });
+		child.on("error", (error) => resolve({ exitCode: 1, output: String(error) }));
+		child.on("close", (code) => resolve({ exitCode: code ?? 1, output }));
+	});
+}
+
+async function writeRunManifest(runDir: string, manifest: RunManifest): Promise<void> {
+	await fs.writeFile(path.join(runDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+}
+
+async function appendRunEvent(runDir: string, event: { timestamp: string; type: string; [key: string]: unknown }): Promise<void> {
+	await fs.appendFile(path.join(runDir, "events.jsonl"), `${JSON.stringify(event)}\n`, "utf8");
 }
 
 async function discoverSessions(): Promise<SessionInfo[]> {
@@ -472,6 +708,7 @@ async function getDrainStatus(includeChildSessions = false): Promise<DrainStatus
 	const sessions = discoveredSessions.filter((session) => includeChildSessions || !session.is_subagent_child);
 	const processed = sessions.filter((session) => session.status === "processed").length;
 	const failed = sessions.filter((session) => session.status === "failed").length;
+	const deferred = sessions.filter((session) => session.status === "deferred").length;
 	return {
 		session_dirs: sessionDirs,
 		missing_session_dirs: missingSessionDirs,
@@ -479,7 +716,8 @@ async function getDrainStatus(includeChildSessions = false): Promise<DrainStatus
 		total: sessions.length,
 		processed,
 		failed,
-		unprocessed: sessions.length - processed - failed,
+		deferred,
+		unprocessed: sessions.length - processed - failed - deferred,
 		changed: sessions.filter((session) => session.changed).length,
 		retryable: failed,
 		excluded_child_sessions: excludedChildSessions,
@@ -487,7 +725,7 @@ async function getDrainStatus(includeChildSessions = false): Promise<DrainStatus
 }
 
 async function findNextSessions(limit: number, sessionId?: string, includeChildSessions = false) {
-	const eligibleSessions = (await discoverSessions()).filter((session) => session.status !== "processed" && (includeChildSessions || !session.is_subagent_child) && (!sessionId || session.session_id === sessionId));
+	const eligibleSessions = (await discoverSessions()).filter((session) => session.status !== "processed" && session.status !== "deferred" && (includeChildSessions || !session.is_subagent_child) && (!sessionId || session.session_id === sessionId));
 	const sessions: Array<SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }> = [];
 	let chunkCount = 0;
 	let oversizedSessionId: string | undefined;
