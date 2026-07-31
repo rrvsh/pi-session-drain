@@ -16,6 +16,7 @@ const LOCK_STALE_MS = 60_000;
 const RUN_LOCK_STALE_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_RUN_MAX_SESSIONS = 1;
 const DEFAULT_RUN_MAX_CHUNKS_PER_SESSION = 80;
+const DEFAULT_RUN_SESSION_CONCURRENCY = 1;
 const DEFAULT_RUN_CHUNK_CONCURRENCY = 4;
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MANAGED_AGENT_MARKER = "<!-- managed-by: pi-session-drain -->";
@@ -76,6 +77,7 @@ type State = { records: StatusRecord[] };
 type RunOptions = {
 	max_sessions: number;
 	max_chunks_per_session: number;
+	session_concurrency: number;
 	chunk_concurrency: number;
 	timeout_ms: number;
 };
@@ -437,6 +439,7 @@ async function runDeterministicDrain(): Promise<{ run_id: string; run_dir: strin
 		const options: RunOptions = {
 			max_sessions: Number(process.env.PI_SESSION_DRAIN_MAX_SESSIONS ?? DEFAULT_RUN_MAX_SESSIONS),
 			max_chunks_per_session: Number(process.env.PI_SESSION_DRAIN_MAX_CHUNKS_PER_SESSION ?? DEFAULT_RUN_MAX_CHUNKS_PER_SESSION),
+			session_concurrency: Number(process.env.PI_SESSION_DRAIN_SESSION_CONCURRENCY ?? DEFAULT_RUN_SESSION_CONCURRENCY),
 			chunk_concurrency: Number(process.env.PI_SESSION_DRAIN_CHUNK_CONCURRENCY ?? DEFAULT_RUN_CHUNK_CONCURRENCY),
 			timeout_ms: Number(process.env.PI_SESSION_DRAIN_TIMEOUT_MS ?? DEFAULT_RUN_TIMEOUT_MS),
 		};
@@ -447,10 +450,18 @@ async function runDeterministicDrain(): Promise<{ run_id: string; run_dir: strin
 		await fs.mkdir(path.join(runDir, "synthesis"), { recursive: true });
 		const manifest: RunManifest = { run_id: runId, started_at: new Date(started).toISOString(), status: "running", options, sessions: [] };
 		await writeRunManifest(runDir, manifest);
+		let manifestWriteQueue = Promise.resolve();
+		const writeManifestSerial = async (): Promise<void> => {
+			manifestWriteQueue = manifestWriteQueue.then(() => writeRunManifest(runDir, manifest));
+			await manifestWriteQueue;
+		};
+		const appendRunEventSerial = async (event: { timestamp: string; type: string; [key: string]: unknown }): Promise<void> => {
+			manifestWriteQueue = manifestWriteQueue.then(() => appendRunEvent(runDir, event));
+			await manifestWriteQueue;
+		};
 		try {
-			for (let processedSessions = 0; processedSessions < options.max_sessions && Date.now() - started < options.timeout_ms;) {
-				const next = await nextSessionForRun(options.max_chunks_per_session);
-				if (!next) break;
+			const plannedSessions = await planSessionsForRun(options.max_sessions);
+			for (const next of plannedSessions) {
 				const sessionState: RunManifest["sessions"][number] = {
 					session_id: next.session_id,
 					session_path: next.session_path,
@@ -460,48 +471,18 @@ async function runDeterministicDrain(): Promise<{ run_id: string; run_dir: strin
 					chunks: next.chunks.map((chunk) => ({ ...chunk })),
 				};
 				manifest.sessions.push(sessionState);
-				await appendRunEvent(runDir, { timestamp: new Date().toISOString(), type: "session_planned", session_id: next.session_id, chunk_count: next.chunk_count });
-				await writeRunManifest(runDir, manifest);
-				if (next.chunk_count > options.max_chunks_per_session) {
-					sessionState.status = "deferred";
-					sessionState.error = `Session requires ${next.chunk_count} chunks, above max_chunks_per_session ${options.max_chunks_per_session}`;
-					await markSession(next.session_id, "deferred");
-					processedSessions += 1;
-					await writeRunManifest(runDir, manifest);
-					continue;
-				}
-				const chunkReports = await runChunkReports(runDir, next, options.chunk_concurrency);
-				for (const report of chunkReports) {
-					const chunk = sessionState.chunks.find((candidate) => candidate.chunk_index === report.chunk.chunk_index);
-					if (chunk) {
-						chunk.report_path = report.path;
-						chunk.status = report.ok ? "processed" : "failed";
-					}
-				}
-				const validationError = validateChunkReports(next.chunks, chunkReports);
-				if (validationError) {
-					sessionState.status = "failed";
-					sessionState.error = validationError;
-					await markSession(next.session_id, "failed");
-					processedSessions += 1;
-					await writeRunManifest(runDir, manifest);
-					continue;
-				}
-				sessionState.status = "chunks_processed";
-				await writeRunManifest(runDir, manifest);
-				const synthesis = await runSynthesis(runDir, next, chunkReports.map((report) => report.path));
-				sessionState.synthesis_path = synthesis.path;
-				if (synthesis.ok) {
-					sessionState.status = "processed";
-					await markSession(next.session_id, "processed");
-				} else {
-					sessionState.status = "failed";
-					sessionState.error = "Synthesis did not report Outcome: processed";
-					await markSession(next.session_id, "failed");
-				}
-				processedSessions += 1;
-				await writeRunManifest(runDir, manifest);
+				await appendRunEventSerial({ timestamp: new Date().toISOString(), type: "session_planned", session_id: next.session_id, chunk_count: next.chunk_count });
+				await writeManifestSerial();
 			}
+			let nextSessionIndex = 0;
+			async function worker(): Promise<void> {
+				while (nextSessionIndex < plannedSessions.length && Date.now() - started < options.timeout_ms) {
+					const next = plannedSessions[nextSessionIndex++]!;
+					const sessionState = manifest.sessions.find((candidate) => candidate.session_id === next.session_id)!;
+					await processPlannedSession(runDir, options, next, sessionState, writeManifestSerial);
+				}
+			}
+			await Promise.all(Array.from({ length: Math.max(1, Math.min(options.session_concurrency, plannedSessions.length)) }, () => worker()));
 			manifest.status = manifest.sessions.some((session) => session.status === "failed") ? "failed" : "processed";
 			return { run_id: runId, run_dir: runDir, status: manifest.status };
 		} catch (error: any) {
@@ -536,14 +517,60 @@ async function withRunLock<T>(operation: () => Promise<T>): Promise<T> {
 	}
 }
 
-async function nextSessionForRun(maxChunksPerSession: number): Promise<(SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }) | undefined> {
+async function planSessionsForRun(maxSessions: number): Promise<Array<SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }>> {
 	const eligible = (await discoverSessions()).filter((session) => session.status !== "processed" && session.status !== "deferred" && !session.is_subagent_child);
+	const planned: Array<SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }> = [];
 	for (const session of eligible) {
+		if (planned.length >= maxSessions) break;
 		const plan = await buildTranscriptChunks(session.session_id);
-		if (plan.chunk_count > maxChunksPerSession) return { ...session, chunk_count: plan.chunk_count, chunks: plan.chunks };
-		return { ...session, chunk_count: plan.chunk_count, chunks: plan.chunks };
+		planned.push({ ...session, chunk_count: plan.chunk_count, chunks: plan.chunks });
 	}
-	return undefined;
+	return planned;
+}
+
+async function processPlannedSession(
+	runDir: string,
+	options: RunOptions,
+	next: SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] },
+	sessionState: RunManifest["sessions"][number],
+	writeManifest: () => Promise<void>,
+): Promise<void> {
+	if (next.chunk_count > options.max_chunks_per_session) {
+		sessionState.status = "deferred";
+		sessionState.error = `Session requires ${next.chunk_count} chunks, above max_chunks_per_session ${options.max_chunks_per_session}`;
+		await markSession(next.session_id, "deferred");
+		await writeManifest();
+		return;
+	}
+	const chunkReports = await runChunkReports(runDir, next, options.chunk_concurrency);
+	for (const report of chunkReports) {
+		const chunk = sessionState.chunks.find((candidate) => candidate.chunk_index === report.chunk.chunk_index);
+		if (chunk) {
+			chunk.report_path = report.path;
+			chunk.status = report.ok ? "processed" : "failed";
+		}
+	}
+	const validationError = validateChunkReports(next.chunks, chunkReports);
+	if (validationError) {
+		sessionState.status = "failed";
+		sessionState.error = validationError;
+		await markSession(next.session_id, "failed");
+		await writeManifest();
+		return;
+	}
+	sessionState.status = "chunks_processed";
+	await writeManifest();
+	const synthesis = await runSynthesis(runDir, next, chunkReports.map((report) => report.path));
+	sessionState.synthesis_path = synthesis.path;
+	if (synthesis.ok) {
+		sessionState.status = "processed";
+		await markSession(next.session_id, "processed");
+	} else {
+		sessionState.status = "failed";
+		sessionState.error = "Synthesis did not report Outcome: processed";
+		await markSession(next.session_id, "failed");
+	}
+	await writeManifest();
 }
 
 async function runChunkReports(runDir: string, session: SessionInfo & { chunk_count: number; chunks: TranscriptChunk[] }, concurrency: number): Promise<Array<{ chunk: TranscriptChunk; path: string; ok: boolean }>> {
