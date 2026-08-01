@@ -649,9 +649,17 @@ Skipped candidates:
 Outcome: chunk-processed`;
 }
 
+function piPromptArgs(prompt: string): string[] {
+	const args = ["--no-session"];
+	const model = process.env.PI_SESSION_DRAIN_MODEL?.trim();
+	if (model) args.push("--model", model);
+	args.push("-p", prompt);
+	return args;
+}
+
 async function runPiPrompt(prompt: string, cwd: string): Promise<{ exitCode: number; output: string }> {
 	return new Promise((resolve) => {
-		const child = spawn("pi", ["--no-session", "-p", prompt], { cwd, env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn("pi", piPromptArgs(prompt), { cwd, env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" }, stdio: ["ignore", "pipe", "pipe"] });
 		let output = "";
 		child.stdout.on("data", (chunk) => { output += chunk.toString(); });
 		child.stderr.on("data", (chunk) => { output += chunk.toString(); });

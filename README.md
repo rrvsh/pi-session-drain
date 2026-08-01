@@ -32,6 +32,7 @@ Default session directory: `~/.pi/agent/sessions/`.
 Additional/configured directories can be supplied either with:
 
 - `PI_SESSION_DRAIN_DIRS=/path/a:/path/b`
+- `PI_SESSION_DRAIN_MODEL=openai-codex/gpt-5.6-luna` to set the model for spawned Pi chunk and synthesis runs
 - `~/Agents/.session-drain/config.json`:
 
 ```json
